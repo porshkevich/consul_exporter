@@ -18,8 +18,6 @@ import (
 	"gopkg.in/alecthomas/kingpin.v2"
 
 	consul_api "github.com/hashicorp/consul/api"
-	consul "github.com/hashicorp/consul/consul/structs"
-	cleanhttp "github.com/hashicorp/go-cleanhttp"
 )
 
 const (
@@ -60,7 +58,7 @@ var (
 	serviceNodesHealthy = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", "catalog_service_node_healthy"),
 		"Is this service healthy on this node?",
-		[]string{"service_id", "node", "service_name"}, nil,
+		[]string{"service_id", "node", "service_name", "tags"}, nil,
 	)
 	nodeChecks = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", "health_node_status"),
@@ -70,7 +68,7 @@ var (
 	serviceChecks = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", "health_service_status"),
 		"Status of health checks associated with a service.",
-		[]string{"check", "node", "service_id", "service_name", "status"}, nil,
+		[]string{"check", "node", "service_id", "service_name", "status", "tags"}, nil,
 	)
 	keyValues = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", "catalog_kv"),
@@ -112,23 +110,18 @@ func NewExporter(opts consulOpts, kvPrefix, kvFilter string, healthSummary bool)
 		return nil, fmt.Errorf("invalid consul URL: %s", uri)
 	}
 
-	tlsConfig, err := consul_api.SetupTLSConfig(&consul_api.TLSConfig{
+	tlsConfig := consul_api.TLSConfig{
 		Address:  opts.serverName,
 		CAFile:   opts.caFile,
 		CertFile: opts.certFile,
 		KeyFile:  opts.keyFile,
-	})
-	if err != nil {
-		return nil, err
 	}
-	transport := cleanhttp.DefaultPooledTransport()
-	transport.TLSClientConfig = tlsConfig
-
 	config := consul_api.DefaultConfig()
 	config.Address = u.Host
 	config.Scheme = u.Scheme
+	config.TLSConfig = tlsConfig
+        config.HttpClient, err = consul_api.NewHttpClient(config.Transport, config.TLSConfig)
 	config.HttpClient.Timeout = opts.timeout
-	config.HttpClient.Transport = transport
 
 	client, err := consul_api.NewClient(config)
 	if err != nil {
@@ -225,44 +218,26 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	for _, hc := range checks {
-		var passing, warning, critical, maintenance float64
+		var status float64
 
 		switch hc.Status {
-		case consul.HealthPassing:
-			passing = 1
-		case consul.HealthWarning:
-			warning = 1
-		case consul.HealthCritical:
-			critical = 1
-		case consul.HealthMaint:
-			maintenance = 1
+		case consul_api.HealthPassing:
+			status = 1
+		case consul_api.HealthWarning:
+			status = 2
+		case consul_api.HealthCritical:
+			status = 3
+		case consul_api.HealthMaint:
+			status = 0
 		}
 
 		if hc.ServiceID == "" {
 			ch <- prometheus.MustNewConstMetric(
-				nodeChecks, prometheus.GaugeValue, passing, hc.CheckID, hc.Node, consul.HealthPassing,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				nodeChecks, prometheus.GaugeValue, warning, hc.CheckID, hc.Node, consul.HealthWarning,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				nodeChecks, prometheus.GaugeValue, critical, hc.CheckID, hc.Node, consul.HealthCritical,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				nodeChecks, prometheus.GaugeValue, maintenance, hc.CheckID, hc.Node, consul.HealthMaint,
+				nodeChecks, prometheus.GaugeValue, status, hc.CheckID, hc.Node, hc.Status,
 			)
 		} else {
 			ch <- prometheus.MustNewConstMetric(
-				serviceChecks, prometheus.GaugeValue, passing, hc.CheckID, hc.Node, hc.ServiceID, hc.ServiceName, consul.HealthPassing,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				serviceChecks, prometheus.GaugeValue, warning, hc.CheckID, hc.Node, hc.ServiceID, hc.ServiceName, consul.HealthWarning,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				serviceChecks, prometheus.GaugeValue, critical, hc.CheckID, hc.Node, hc.ServiceID, hc.ServiceName, consul.HealthCritical,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				serviceChecks, prometheus.GaugeValue, maintenance, hc.CheckID, hc.Node, hc.ServiceID, hc.ServiceName, consul.HealthMaint,
+				serviceChecks, prometheus.GaugeValue, status, hc.CheckID, hc.Node, hc.ServiceID, hc.ServiceName, hc.Status, "," + strings.Join(hc.ServiceTags, ",") + ",",
 			)
 		}
 	}
@@ -299,19 +274,21 @@ func (e *Exporter) collectOneHealthSummary(ch chan<- prometheus.Metric, serviceN
 		// We have a Node, a Service, and one or more Checks. Our
 		// service-node combo is passing if all checks have a `status`
 		// of "passing."
-		passing := 1.
-		for _, hc := range entry.Checks {
-			if hc.Status != consul.HealthPassing {
-				passing = 0
-				break
-			}
+		var status float64
+
+		switch entry.Checks.AggregatedStatus() {
+		case consul_api.HealthPassing:
+			status = 1
+		case consul_api.HealthWarning:
+			status = 2
+		case consul_api.HealthCritical:
+			status = 3
+		case consul_api.HealthMaint:
+			status = 0
 		}
 		ch <- prometheus.MustNewConstMetric(
-			serviceNodesHealthy, prometheus.GaugeValue, passing, entry.Service.ID, entry.Node.Node, entry.Service.Service,
+			serviceNodesHealthy, prometheus.GaugeValue, status, entry.Service.ID, entry.Node.Node, entry.Service.Service, ","+strings.Join(entry.Service.Tags, ",")+",",
 		)
-		for _, tag := range entry.Service.Tags {
-			ch <- prometheus.MustNewConstMetric(serviceTag, prometheus.GaugeValue, 1, entry.Service.ID, entry.Node.Node, tag)
-		}
 	}
 	return nil
 }
