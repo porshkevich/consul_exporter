@@ -208,6 +208,7 @@ func (e *Exporter) collectByDatacenter(ch chan<- prometheus.Metric, datacenters 
 		go func(s string) {
 			defer wg.Done()
 
+			var queryOptions = queryOptions
 			queryOptions.Datacenter = s
 			// How many nodes are registered?
 			nodes, _, err := e.client.Catalog().Nodes(&queryOptions)
@@ -230,7 +231,7 @@ func (e *Exporter) collectByDatacenter(ch chan<- prometheus.Metric, datacenters 
 			)
 
 			if e.healthSummary {
-				e.collectHealthSummary(ch, serviceNames)
+				e.collectHealthSummary(ch, serviceNames, &queryOptions)
 			}
 
 			checks, _, err := e.client.Health().State("any", &queryOptions)
@@ -271,24 +272,24 @@ func (e *Exporter) collectByDatacenter(ch chan<- prometheus.Metric, datacenters 
 
 // collectHealthSummary collects health information about every node+service
 // combination. It will cause one lookup query per service.
-func (e *Exporter) collectHealthSummary(ch chan<- prometheus.Metric, serviceNames map[string][]string) {
+func (e *Exporter) collectHealthSummary(ch chan<- prometheus.Metric, serviceNames map[string][]string, queryOptions *consul_api.QueryOptions) {
 	var wg sync.WaitGroup
 
 	for s := range serviceNames {
 		wg.Add(1)
 		go func(s string) {
 			defer wg.Done()
-			e.collectOneHealthSummary(ch, s)
+			e.collectOneHealthSummary(ch, s, queryOptions)
 		}(s)
 	}
 
 	wg.Wait()
 }
 
-func (e *Exporter) collectOneHealthSummary(ch chan<- prometheus.Metric, serviceName string) error {
+func (e *Exporter) collectOneHealthSummary(ch chan<- prometheus.Metric, serviceName string, queryOptions *consul_api.QueryOptions) error {
 	log.Debugf("Fetching health summary for: %s", serviceName)
 
-	service, _, err := e.client.Health().Service(serviceName, "", false, &queryOptions)
+	service, _, err := e.client.Health().Service(serviceName, "", false, queryOptions)
 	if err != nil {
 		log.Errorf("Failed to query service health: %v", err)
 		return err
