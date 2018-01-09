@@ -43,12 +43,12 @@ var (
 	nodeCount = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", "serf_lan_members"),
 		"How many members are in the cluster.",
-		nil, nil,
+		[]string{"datacenter"}, nil,
 	)
 	serviceCount = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", "catalog_services"),
 		"How many services are in the cluster.",
-		nil, nil,
+		[]string{"datacenter"}, nil,
 	)
 	serviceTag = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", "service_tag"),
@@ -58,17 +58,17 @@ var (
 	serviceNodesHealthy = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", "catalog_service_node_healthy"),
 		"Is this service healthy on this node?",
-		[]string{"service_id", "node", "service_name", "tags"}, nil,
+		[]string{"service_id", "node", "service_name", "datacenter", "tags"}, nil,
 	)
 	nodeChecks = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", "health_node_status"),
 		"Status of health checks associated with a node.",
-		[]string{"check", "node", "status"}, nil,
+		[]string{"check", "node", "status", "datacenter"}, nil,
 	)
 	serviceChecks = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", "health_service_status"),
 		"Status of health checks associated with a service.",
-		[]string{"check", "node", "service_id", "service_name", "status", "tags"}, nil,
+		[]string{"check", "node", "service_id", "service_name", "status", "datacenter", "tags"}, nil,
 	)
 	keyValues = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", "catalog_kv"),
@@ -187,62 +187,86 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		)
 	}
 
-	// How many nodes are registered?
-	nodes, _, err := e.client.Catalog().Nodes(&queryOptions)
+	datacenters, err := e.client.Catalog().Datacenters()
 	if err != nil {
-		// FIXME: How should we handle a partial failure like this?
-	} else {
-		ch <- prometheus.MustNewConstMetric(
-			nodeCount, prometheus.GaugeValue, float64(len(nodes)),
-		)
+		c, _ := e.client.Agent().Self()
+		datacenters = []string{c["Config"]["Datacenter"].(string)}
 	}
 
-	// Query for the full list of services.
-	serviceNames, _, err := e.client.Catalog().Services(&queryOptions)
-	if err != nil {
-		// FIXME: How should we handle a partial failure like this?
-		return
-	}
-	ch <- prometheus.MustNewConstMetric(
-		serviceCount, prometheus.GaugeValue, float64(len(serviceNames)),
-	)
-
-	if e.healthSummary {
-		e.collectHealthSummary(ch, serviceNames)
-	}
-
-	checks, _, err := e.client.Health().State("any", &queryOptions)
-	if err != nil {
-		log.Errorf("Failed to query service health: %v", err)
-		return
-	}
-
-	for _, hc := range checks {
-		var status float64
-
-		switch hc.Status {
-		case consul_api.HealthPassing:
-			status = 1
-		case consul_api.HealthWarning:
-			status = 2
-		case consul_api.HealthCritical:
-			status = 3
-		case consul_api.HealthMaint:
-			status = 0
-		}
-
-		if hc.ServiceID == "" {
-			ch <- prometheus.MustNewConstMetric(
-				nodeChecks, prometheus.GaugeValue, status, hc.CheckID, hc.Node, hc.Status,
-			)
-		} else {
-			ch <- prometheus.MustNewConstMetric(
-				serviceChecks, prometheus.GaugeValue, status, hc.CheckID, hc.Node, hc.ServiceID, hc.ServiceName, hc.Status, "," + strings.Join(hc.ServiceTags, ",") + ",",
-			)
-		}
-	}
+	e.collectByDatacenter(ch, datacenters)
 
 	e.collectKeyValues(ch)
+}
+
+// collectHealthSummary collects health information about every node+service
+// combination. It will cause one lookup query per service.
+func (e *Exporter) collectByDatacenter(ch chan<- prometheus.Metric, datacenters []string) {
+	var wg sync.WaitGroup
+
+	for _, s := range datacenters {
+		wg.Add(1)
+		go func(s string) {
+			defer wg.Done()
+
+			queryOptions.Datacenter = s
+			// How many nodes are registered?
+			nodes, _, err := e.client.Catalog().Nodes(&queryOptions)
+			if err != nil {
+				// FIXME: How should we handle a partial failure like this?
+			} else {
+				ch <- prometheus.MustNewConstMetric(
+					nodeCount, prometheus.GaugeValue, float64(len(nodes)), queryOptions.Datacenter,
+				)
+			}
+
+			// Query for the full list of services.
+			serviceNames, _, err := e.client.Catalog().Services(&queryOptions)
+			if err != nil {
+				// FIXME: How should we handle a partial failure like this?
+				return
+			}
+			ch <- prometheus.MustNewConstMetric(
+				serviceCount, prometheus.GaugeValue, float64(len(serviceNames)), queryOptions.Datacenter,
+			)
+
+			if e.healthSummary {
+				e.collectHealthSummary(ch, serviceNames)
+			}
+
+			checks, _, err := e.client.Health().State("any", &queryOptions)
+			if err != nil {
+				log.Errorf("Failed to query service health: %v", err)
+				return
+			}
+
+			for _, hc := range checks {
+				var status float64
+
+				switch hc.Status {
+				case consul_api.HealthPassing:
+					status = 1
+				case consul_api.HealthWarning:
+					status = 2
+				case consul_api.HealthCritical:
+					status = 3
+				case consul_api.HealthMaint:
+					status = 0
+				}
+
+				if hc.ServiceID == "" {
+					ch <- prometheus.MustNewConstMetric(
+						nodeChecks, prometheus.GaugeValue, status, hc.CheckID, hc.Node, hc.Status, queryOptions.Datacenter,
+					)
+				} else {
+					ch <- prometheus.MustNewConstMetric(
+						serviceChecks, prometheus.GaugeValue, status, hc.CheckID, hc.Node, hc.ServiceID, hc.ServiceName, queryOptions.Datacenter, hc.Status, "," + strings.Join(hc.ServiceTags, ",") + ",",
+					)
+				}
+			}
+		}(s)
+	}
+
+	wg.Wait()
 }
 
 // collectHealthSummary collects health information about every node+service
@@ -287,7 +311,7 @@ func (e *Exporter) collectOneHealthSummary(ch chan<- prometheus.Metric, serviceN
 			status = 0
 		}
 		ch <- prometheus.MustNewConstMetric(
-			serviceNodesHealthy, prometheus.GaugeValue, status, entry.Service.ID, entry.Node.Node, entry.Service.Service, ","+strings.Join(entry.Service.Tags, ",")+",",
+			serviceNodesHealthy, prometheus.GaugeValue, status, entry.Service.ID, entry.Node.Node, entry.Service.Service, queryOptions.Datacenter, ","+strings.Join(entry.Service.Tags, ",")+",",
 		)
 	}
 	return nil
